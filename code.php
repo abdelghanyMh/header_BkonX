@@ -18,24 +18,29 @@ use Illuminate\Support\Facades\Session;
 
 class UserLoginController extends Controller
 {
-    private $guard_name = 'web' ;
+    // Définir le nom du gardien par défaut
+    private $guard_name = 'web';
 
     /**
-     * Where to redirect users after login.
-     *
+     * Définissez le chemin de redirection par défaut après la connexion(login).
      * @var string
      */
     protected string $redirectTo = RouteServiceProvider::HOME;
+
+    // Initialiser le service FirebaseTopic
     protected FirebaseTopic $topic;
 
     public function __construct()
     {
+        // Initialiser l'instance FirebaseTopic
         $this->topic = (new FirebaseTopic());
+        //Appliquer le middleware « guest » à toutes les méthodes sauf « logout »
+
         $this->middleware('guest:web')->except('logout');
     }
 
     /**
-     * return login form for user
+     *  Afficher le formulaire de connexion
      *
      * @return Renderable
      */
@@ -45,132 +50,118 @@ class UserLoginController extends Controller
     }
 
     /**
+     *  Gérer la tentative de connexion de l'utilisateur
      * @param LoginRequest $request
      * @return RedirectResponse
      */
     public function login(LoginRequest $request): RedirectResponse
     {
+        // Valider les entrées utilisateur en utilisant le système de validation de Laravel et les règles définies dans LoginRequest.php. (public function rules())
+
         $data = $request->validated();
 
-        $user = User::where('email',$data['email'])->first() ?? Employee::where('email',$data['email'])->first();
+        // Vérifier si l'utilisateur existe
+        $user = User::where('email', $data['email'])->first() ?? Employee::where('email', $data['email'])->first();
 
-        if ($user)
-        {
-            if($user instanceof Employee){
-                $this->guard_name="employee" ;
-            }
+        // Si l'utilisateur n'est pas trouvé, revenez à la page de connexion avec un message d'erreur
+        if (!$user) {
+            return $this->loginFailed($request);
+        }
 
-            switch ($user->state) {
+        if ($user instanceof Employee) {
+            $this->guard_name = "employee";
+        }
 
-                case State::PENDING:
-                    session()->flash('login_error',trans('auth.state.pending'));
-                    return redirect()->back();
-                    break;
+        //Vérifiez l'état de l'utilisateur et revenez à la page de connexion avec un message d'erreur
+        switch ($user->state) {
+            case State::PENDING:
+                return $this->loginFailed($request, trans('auth.state.pending'));
+            case State::INACTIVE:
+                return $this->loginFailed($request, trans('auth.state.inactive'));
+        }
 
-                case State::INACTIVE:
-                    session()->flash('login_error',trans('auth.state.inactive'));
-                    return redirect()->back();
-                    break;
-            }
-        
-                // login success
-                if ($this->guard()->attempt($request->only(['email','password']),$request->has('remember_me'))){
+        // Si la connexion réussit, procédez à la connexion et redirigez vers la page prévue
 
-                    if ($this->guard()->user()->profile)
-                    {
-                        Session::put('profile',$this->guard()->user()->profile);
-                    }
-        
-                     if($data['fcm_token'] != null)
-                     {
-                         $result = $this->topic->subscribe($this->guard()->user()->profile->slug,$data['fcm_token']);
-
-                         if($result)
-                         {
-                             $this->guard()->user()->updateQuietly(
-                                 [
-                                     'has_topic' => true,
-                                     'topic_subscriptions_count' => $this->guard()->user()->topic_subscriptions_count + 1,
-                                 ]
-                             );
-                         }
-                     }
-        
-                    return redirect()->intended($this->redirectTo);
-        
-                }
-        
+        if ($this->guard()->attempt($request->only(['email', 'password']), $request->has('remember_me'))) {
+            $this->processLogin($data);
+            return redirect()->intended($this->redirectTo);
         }
 
 
-
-        //login fails
-        session()->flash('login_error',trans('auth.failed'));
-        return redirect()->back()->withInput($request->input());
+        // handel si toutes les conditions ci-dessus échouent, redirigez vers la page de connexion
+        return $this->loginFailed($request);
     }
 
     /**
+     * Gérer la déconnexion des utilisateurs
      * @param Request $request
      * @return JsonResponse|RedirectResponse
      */
     public function logout(Request $request): JsonResponse|RedirectResponse
     {
-        if(Auth::guard('employee')->check())
-        {
-            $this->guard_name="employee";
-        }
-        
-        if ($this->guard()->user()->has_topic)
-        {
-            $count = $this->guard()->user()->topic_subscriptions_count;
-
-            if($request->get('fcm_token'))
-            {
-                $this->topic->unsubscribe($request->get('fcm_token'));
-                if($count - 1 <= 0)
-                {
-                    $this->guard()->user()->update(
-                        [
-                            'has_topic' => false,
-                            'topic_subscriptions_count' => 0,
-                        ]
-                    );
-                }
-                else
-                {
-                    $this->guard()->user()->update(
-                        [
-                            'topic_subscriptions_count' => $count - 1,
-                        ]
-                    );
-                }
-            }
+        if (Auth::guard('employee')->check()) {
+            $this->guard_name = "employee";
         }
 
-        $lang = $this->guard()->user()->lang;
-
-        session()->forget('profile');
-
-        $this->guard()->logout();
-
-        $request->session()->invalidate();
-
-        $request->session()->regenerateToken();
-
-        session()->put('locale', $lang);
-
-        if($request->wantsJson())
-        {
-            return response()->json(__('messages.flash.success'));
+        if ($this->guard()->user()->has_topic && $request->filled('fcm_token')) {
+            $this->processLogout($request);
         }
 
-        return to_route('home');
+        //Effectuer des actions de déconnexion et rediriger vers la page d'accueil
+        $this->performLogoutActions($request);
+        return redirect()->route('home');
     }
+
 
     private function guard()
     {
         return Auth::guard($this->guard_name);
     }
 
-}
 
+    private function processLogin($data)
+    {
+        if ($this->guard()->user()->profile) {
+            Session::put('profile', $this->guard()->user()->profile);
+        }
+
+        if ($data['fcm_token'] !== null) {
+            $result = $this->topic->subscribe($this->guard()->user()->profile->slug, $data['fcm_token']);
+            if ($result) {
+                $this->guard()->user()->updateQuietly([
+                    'has_topic' => true,
+                    'topic_subscriptions_count' => $this->guard()->user()->topic_subscriptions_count + 1,
+                ]);
+            }
+        }
+    }
+
+    private function loginFailed($request, $message = null)
+    {
+        session()->flash('login_error', $message ?? trans('auth.failed'));
+        return redirect()->back()->withInput($request->input());
+    }
+
+    private function processLogout($request)
+    {
+        $count = $this->guard()->user()->topic_subscriptions_count;
+        $this->topic->unsubscribe($request->get('fcm_token'));
+        $this->guard()->user()->update([
+            'has_topic' => $count - 1 > 0,
+            'topic_subscriptions_count' => max(0, $count - 1),
+        ]);
+    }
+
+    // Perform logout actions
+    private function performLogoutActions($request)
+    {
+        $lang = $this->guard()->user()->lang;
+
+        session()->forget('profile');
+        $this->guard()->logout();
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+        session()->put('locale', $lang);
+    }
+
+}
